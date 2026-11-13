@@ -5,3 +5,15 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+thiserror = { workspace = true }
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_System_Console",
+    "Win32_System_Pipes",
+    "Win32_System_Threading",
+    "Win32_Security",
+] }
+
+[[example]]
+name = "cmd_echo"
+path = "examples/cmd_echo.rs"
