@@ -4,8 +4,8 @@ Running log of what's done, what's in flight, and what's blocked. Newest entries
 
 ## Status at a glance
 
-- **Current milestone:** M1 — ConPTY round-trip (code written, awaiting first `cargo test`).
-- **Last shipped:** M0 scaffold.
+- **Current milestone:** M2 — one pane end-to-end (code written, awaiting first interactive attach).
+- **Last shipped:** M1 — ConPTY round-trip.
 - **Blocked on:** nothing.
 
 ## Milestone checklist
@@ -22,6 +22,15 @@ Running log of what's done, what's in flight, and what's blocked. Newest entries
 - [ ] **M9 — docs + installer + v0.1.0.** README, zipped release, optional MSIX, tag.
 
 ## Log
+
+### 2026-11-13 — M2 single-pane daemon + client written
+- Branch `m2-one-pane-end-to-end`. Workspace deps grew `tokio` (rt-multi-thread, macros, net, io-util, io-std, sync, time), `rmp-serde = "1.3"`, `crossterm = "0.28"`.
+- `wmux-proto` now carries real wire types: `Hello`, `Welcome`, `PtySize`, and two message enums `ClientMsg { Hello, Input, Resize, Bye }` / `ServerMsg { Welcome, Output, ProtocolMismatch, Bye }`. Everything is serde-derived; `PROTOCOL_VERSION` stays at `1`.
+- `wmux-ipc` provides length-prefixed MessagePack framing (`write_frame` / `read_frame`, 4-byte big-endian length, 16 MiB payload cap) and the shared pipe path `\\.\pipe\wmux`. Per-user SID suffix (SPEC §4.3) is deferred — single local wmux assumed for M2.
+- `wmux-conpty` now has `unsafe impl Send for Pty` with a safety comment: HPCON/attribute-list pointers are opaque, and ConPTY's own APIs are documented thread-safe when callers serialize access.
+- `wmuxd` runs a tokio multi-thread runtime. One client at a time: it accepts on the pipe, reads the `Hello`, version-checks, spawns `cmd.exe` through `wmux-conpty`, sends `Welcome`, then runs three concurrent movers — an OS thread pumping `PtyReader` → `mpsc::Sender<Vec<u8>>`, an OS thread pumping `std::sync::mpsc::Receiver<Vec<u8>>` → `PtyWriter`, and a tokio task forwarding the output channel to `ServerMsg::Output` frames. The main client task reads `ClientMsg` frames and dispatches (`Input`, `Resize`, `Bye`). On disconnect it drops the input channel, joins the writer thread, drops the `Pty` (closes ConPTY), joins the reader thread, and loops back to serve the next client.
+- `wmux attach` opens the pipe, sends `Hello` with the current terminal size (via `crossterm::terminal::size`), handles the `Welcome` / `ProtocolMismatch` fork, enters raw mode (guarded by a `RawModeGuard` that restores on any exit), spawns an OS thread reading stdin and feeding an mpsc, and uses `tokio::select!` to multiplex pipe reads (→ stdout) and stdin chunks (→ `ClientMsg::Input` frames). No resize-while-attached yet; terminal size is a one-shot at handshake.
+- Shell is hardcoded to `cmd.exe` — configurable default lands in M6.
 
 ### 2026-11-13 — M1 ConPTY wrapper written
 - Branch `m1-conpty-round-trip`. `wmux-conpty` now pulls in `windows = "0.58"` with the Console / Pipes / Threading / Foundation / Security feature set.
