@@ -4,7 +4,8 @@ use serde::{Deserialize, Serialize};
 
 // Bump on any change to a wire message. The client refuses to talk to a
 // daemon whose PROTOCOL_VERSION it does not match.
-pub const PROTOCOL_VERSION: u32 = 1;
+// v2 (M3): ServerMsg::GridSnapshot added.
+pub const PROTOCOL_VERSION: u32 = 2;
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct PtySize {
@@ -38,6 +39,10 @@ pub enum ClientMsg {
 #[derive(Debug, Serialize, Deserialize)]
 pub enum ServerMsg {
     Welcome(Welcome),
+    // VT byte stream sent right after Welcome that redraws the current
+    // screen state. The client blits these bytes to stdout before entering
+    // its main loop so reattach shows exactly what detach left behind.
+    GridSnapshot(Vec<u8>),
     Output(Vec<u8>),
     ProtocolMismatch { server: u32, client: u32 },
     Bye(String),
