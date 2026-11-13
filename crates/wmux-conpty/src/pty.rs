@@ -36,6 +36,14 @@ pub struct Pty {
     _attr_list_buf: Vec<u8>,
 }
 
+// HPCON and LPPROC_THREAD_ATTRIBUTE_LIST are opaque Win32 handles (raw
+// pointers), so Rust won't auto-derive Send. Microsoft documents the ConPTY
+// APIs (Resize/ClosePseudoConsole) as safe to call from any thread provided
+// no two threads call them concurrently, and `attr_list` is only read by
+// ClosePseudoConsole on Drop. Callers that share a Pty across threads are
+// expected to serialize access with a Mutex.
+unsafe impl Send for Pty {}
+
 pub struct PtyReader(File);
 pub struct PtyWriter(File);
 
