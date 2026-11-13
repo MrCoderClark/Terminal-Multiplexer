@@ -25,6 +25,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("child exit code: {:?}", exit);
     println!("child pid: {}", pty.pid());
 
+    // ConPTY's render pump needs a beat to flush the child's final output
+    // onto our pipe — ClosePseudoConsole drops anything still in flight.
+    std::thread::sleep(Duration::from_millis(500));
+
     // Dropping the Pty calls ClosePseudoConsole, which closes the output pipe
     // and unblocks the reader thread above.
     drop(pty);
