@@ -4,8 +4,8 @@ Running log of what's done, what's in flight, and what's blocked. Newest entries
 
 ## Status at a glance
 
-- **Current milestone:** M0 — workspace scaffold (scaffold written, awaiting first `cargo build`).
-- **Last shipped:** nothing yet.
+- **Current milestone:** M1 — ConPTY round-trip (code written, awaiting first `cargo test`).
+- **Last shipped:** M0 scaffold.
 - **Blocked on:** nothing.
 
 ## Milestone checklist
@@ -22,6 +22,15 @@ Running log of what's done, what's in flight, and what's blocked. Newest entries
 - [ ] **M9 — docs + installer + v0.1.0.** README, zipped release, optional MSIX, tag.
 
 ## Log
+
+### 2026-11-13 — M1 ConPTY wrapper written
+- Branch `m1-conpty-round-trip`. `wmux-conpty` now pulls in `windows = "0.58"` with the Console / Pipes / Threading / Foundation / Security feature set.
+- `Pty::spawn(command_line, PtySize)` wires up the full ConPTY setup: `CreatePipe` twice, `CreatePseudoConsole`, then an attribute list built via the two-call `InitializeProcThreadAttributeList` dance plus `UpdateProcThreadAttribute(PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE)`, and finally `CreateProcessW` with `EXTENDED_STARTUPINFO_PRESENT`. Pipe HANDLEs are wrapped in `std::fs::File` via `FromRawHandle` so the returned `PtyReader` / `PtyWriter` are plain `Read`/`Write` and inherit `Send`.
+- `Pty::resize`, `Pty::wait(timeout)`, `Pty::pid()` round out the surface. `Drop` calls `ClosePseudoConsole` + `DeleteProcThreadAttributeList`; the child process handle is an `OwnedHandle` so it closes itself.
+- Attribute-list backing storage is held in a `Vec<u8>` field on `Pty` (`_attr_list_buf`) so it outlives the HPCON — the raw pointer stored in `attr_list` is read during `ClosePseudoConsole`.
+- `PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE` is hardcoded as `0x00020016` to insulate the crate from `windows` crate version churn. Documented inline.
+- Example `cargo run -p wmux-conpty --example cmd_echo` spawns `cmd.exe /c echo hello from ConPTY`, prints raw PTY bytes. First visible sign of life.
+- Integration test `crates/wmux-conpty/tests/echo.rs` asserts a known token survives the round-trip. Runs under `cargo test --workspace`.
 
 ### 2026-11-13 — M0 scaffold laid down
 - Branch `m0-scaffold`. Workspace `Cargo.toml` with `resolver = "2"`, `members = ["crates/*"]`, shared `workspace.package` (version 0.0.1, edition 2021, rust 1.75) and `workspace.dependencies` for `anyhow`, `clap`, `thiserror`, `serde`, `tracing`, `tracing-subscriber`.
