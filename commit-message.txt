@@ -1,0 +1,15 @@
+﻿M3 drive-by: harden the ConPTY echo round-trip test for CI
+
+  The wait-then-drain pattern was racy on slow Windows runners.
+  cmd.exe /c echo finishes almost immediately, and ConPTY's render
+  pump runs in a separate process: when the child exits before the
+  pump has rendered its output, ClosePseudoConsole drops whatever
+  hasn't made it onto our output pipe yet. The 500 ms drain delay
+  masked this locally but didn't on GitHub's windows-latest runner.
+
+  Change the command to cmd /c "echo TOKEN & ping -n 2 127.0.0.1
+  >nul" so cmd.exe stays alive for ~1 s after the echo, and swap the
+  "wait for exit, then read" shape for a 15 s polling loop that
+  succeeds the moment the token appears on the output pipe. Dropping
+  the Pty at the end still forces the reader thread to EOF for a
+  clean teardown.
