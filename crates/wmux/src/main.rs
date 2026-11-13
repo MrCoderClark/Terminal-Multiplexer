@@ -9,7 +9,7 @@ use tokio::sync::mpsc;
 use tracing_subscriber::EnvFilter;
 
 use wmux_ipc::{read_frame, write_frame, PIPE_NAME};
-use wmux_proto::{ClientMsg, Hello, PtySize, ServerMsg, PROTOCOL_VERSION};
+use wmux_proto::{ClientMsg, Dir, FocusDir, Hello, PtySize, ServerMsg, Verb, PROTOCOL_VERSION};
 
 #[derive(Parser)]
 #[command(
@@ -77,84 +77,36 @@ async fn attach() -> Result<()> {
         other => bail!("expected Welcome, got {other:?}"),
     }
 
-    // --- grid snapshot --------------------------------------------------
-    // The daemon's next frame is a GridSnapshot carrying the VT redraw for
-    // the current screen state. Capture it (but write it only once we're in
-    // raw mode so the terminal is ready to render VT).
     let snapshot_bytes = match read_frame::<ServerMsg, _>(&mut read_half).await? {
         ServerMsg::GridSnapshot(bytes) => bytes,
         other => bail!("expected GridSnapshot, got {other:?}"),
     };
 
-    // --- raw mode -------------------------------------------------------
     crossterm::terminal::enable_raw_mode().context("entering raw mode")?;
     let _guard = RawModeGuard;
 
-    // Redraw the detached state before anything else.
     {
         let mut out = std::io::stdout().lock();
         out.write_all(&snapshot_bytes)?;
-        let _ = out.write_all(b"\r\n[wmux] attached. Detach: Ctrl+A d\r\n");
+        let _ = out.write_all(
+            b"\r\n[wmux] attached. Ctrl+A d=detach \" vsplit % hsplit hjkl=focus x=kill\r\n",
+        );
         out.flush()?;
     }
 
-    // --- stdin → event channel -----------------------------------------
-    // Blocking stdin read on an OS thread. The thread also implements the
-    // minimal prefix handler: 0x01 (Ctrl+A) arms, 'd' after arming means
-    // detach, anything else after arming is forwarded along with the Ctrl+A
-    // so the shell still sees Ctrl+A when typed twice or followed by a key
-    // that's not a wmux command.
     let (stdin_tx, mut stdin_rx) = mpsc::channel::<StdinEvent>(32);
-    std::thread::spawn(move || {
-        const PREFIX: u8 = 0x01; // Ctrl+A
-        let stdin = std::io::stdin();
-        let mut lock = stdin.lock();
-        let mut buf = [0u8; 1024];
-        let mut armed = false;
+    std::thread::spawn(move || stdin_pump(stdin_tx));
 
-        loop {
-            match lock.read(&mut buf) {
-                Ok(0) | Err(_) => return,
-                Ok(n) => {
-                    let mut out = Vec::with_capacity(n);
-                    for &b in &buf[..n] {
-                        if armed {
-                            armed = false;
-                            match b {
-                                b'd' => {
-                                    if !out.is_empty() {
-                                        let _ =
-                                            stdin_tx.blocking_send(StdinEvent::Bytes(out.clone()));
-                                    }
-                                    let _ = stdin_tx.blocking_send(StdinEvent::Detach);
-                                    return;
-                                }
-                                PREFIX => out.push(PREFIX),
-                                _ => {
-                                    out.push(PREFIX);
-                                    out.push(b);
-                                }
-                            }
-                        } else if b == PREFIX {
-                            armed = true;
-                        } else {
-                            out.push(b);
-                        }
-                    }
-                    if !out.is_empty() && stdin_tx.blocking_send(StdinEvent::Bytes(out)).is_err() {
-                        return;
-                    }
-                }
-            }
-        }
-    });
-
-    // --- main loop: multiplex pipe reads and stdin events --------------
     loop {
         tokio::select! {
             msg = read_frame::<ServerMsg, _>(&mut read_half) => {
                 match msg {
                     Ok(ServerMsg::Output(bytes)) => {
+                        let mut out = std::io::stdout().lock();
+                        out.write_all(&bytes)?;
+                        out.flush()?;
+                    }
+                    Ok(ServerMsg::GridSnapshot(bytes)) => {
                         let mut out = std::io::stdout().lock();
                         out.write_all(&bytes)?;
                         out.flush()?;
@@ -171,6 +123,11 @@ async fn attach() -> Result<()> {
                             break;
                         }
                     }
+                    Some(StdinEvent::Command(verb)) => {
+                        if write_frame(&mut write_half, &ClientMsg::Command(verb)).await.is_err() {
+                            break;
+                        }
+                    }
                     Some(StdinEvent::Detach) => {
                         let _ = write_frame(&mut write_half, &ClientMsg::Bye).await;
                         break;
@@ -184,12 +141,78 @@ async fn attach() -> Result<()> {
     Ok(())
 }
 
+// Blocking stdin reader + prefix handler. Ctrl+A (0x01) arms the prefix;
+// the next byte is interpreted as a wmux command. Anything that isn't a
+// recognised command after Ctrl+A is forwarded along with the Ctrl+A, so
+// the shell still sees Ctrl+A when typed twice or paired with an unbound
+// key.
+fn stdin_pump(tx: mpsc::Sender<StdinEvent>) {
+    const PREFIX: u8 = 0x01; // Ctrl+A
+    let stdin = std::io::stdin();
+    let mut lock = stdin.lock();
+    let mut buf = [0u8; 1024];
+    let mut armed = false;
+
+    loop {
+        match lock.read(&mut buf) {
+            Ok(0) | Err(_) => return,
+            Ok(n) => {
+                let mut out = Vec::with_capacity(n);
+                for &b in &buf[..n] {
+                    if armed {
+                        armed = false;
+                        let cmd: Option<StdinEvent> = match b {
+                            b'd' => Some(StdinEvent::Detach),
+                            b'"' => Some(StdinEvent::Command(Verb::SplitPane(Dir::V))),
+                            b'%' => Some(StdinEvent::Command(Verb::SplitPane(Dir::H))),
+                            b'h' => Some(StdinEvent::Command(Verb::FocusPane(FocusDir::Left))),
+                            b'j' => Some(StdinEvent::Command(Verb::FocusPane(FocusDir::Down))),
+                            b'k' => Some(StdinEvent::Command(Verb::FocusPane(FocusDir::Up))),
+                            b'l' => Some(StdinEvent::Command(Verb::FocusPane(FocusDir::Right))),
+                            b'x' => Some(StdinEvent::Command(Verb::KillPane)),
+                            PREFIX => {
+                                out.push(PREFIX);
+                                None
+                            }
+                            other => {
+                                out.push(PREFIX);
+                                out.push(other);
+                                None
+                            }
+                        };
+                        if let Some(evt) = cmd {
+                            if !out.is_empty() {
+                                let _ =
+                                    tx.blocking_send(StdinEvent::Bytes(std::mem::take(&mut out)));
+                            }
+                            let is_detach = matches!(evt, StdinEvent::Detach);
+                            if tx.blocking_send(evt).is_err() {
+                                return;
+                            }
+                            if is_detach {
+                                return;
+                            }
+                        }
+                    } else if b == PREFIX {
+                        armed = true;
+                    } else {
+                        out.push(b);
+                    }
+                }
+                if !out.is_empty() && tx.blocking_send(StdinEvent::Bytes(out)).is_err() {
+                    return;
+                }
+            }
+        }
+    }
+}
+
 enum StdinEvent {
     Bytes(Vec<u8>),
+    Command(Verb),
     Detach,
 }
 
-// Restore the terminal when attach() returns, panics, or is cancelled.
 struct RawModeGuard;
 impl Drop for RawModeGuard {
     fn drop(&mut self) {
