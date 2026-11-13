@@ -4,8 +4,8 @@ Running log of what's done, what's in flight, and what's blocked. Newest entries
 
 ## Status at a glance
 
-- **Current milestone:** M3 — virtual grid (code written, awaiting first detach/reattach test).
-- **Last shipped:** M2 — one pane end-to-end.
+- **Current milestone:** M4 — splits (code written, awaiting first interactive multi-pane test).
+- **Last shipped:** M3 — virtual grid.
 - **Blocked on:** nothing.
 
 ## Milestone checklist
@@ -22,6 +22,15 @@ Running log of what's done, what's in flight, and what's blocked. Newest entries
 - [ ] **M9 — docs + installer + v0.1.0.** README, zipped release, optional MSIX, tag.
 
 ## Log
+
+### 2026-11-13 — M4 splits + compositor
+- Branch `m4-splits`. No new workspace deps (vt100/tokio already there).
+- `wmux-core` grew a `pane_tree` module alongside `terminal`. `PaneTree = Leaf(PaneId) | Split { dir, ratio, a, b }` with serde derives. `Dir` (H/V), `FocusDir` (Left/Right/Up/Down), and `Rect` live here too. Methods: `contains`, `all_pane_ids`, `split_leaf`, `remove` (refuses the last leaf), `compute_rects` (walks the tree with a 1-column/row border reserved per split), `collect_borders` (returns `BorderSeg::Vertical`/`Horizontal` for rendering), and `focus_from(current, dir, area)` (first adjacent rect in tree order with orthogonal overlap wins). Unit tests cover single-leaf, split with border accounting, remove-promotes-sibling, remove-last-fails, and focus-right/left.
+- `wmux-proto` gets `Verb { SplitPane(Dir), FocusPane(FocusDir), KillPane }` and `ClientMsg::Command(Verb)`. `Dir` / `FocusDir` are re-exported from `wmux-core` to keep one definition. `PROTOCOL_VERSION` bumped to `3` per CLAUDE.md rule #5.
+- `wmuxd` is reorganised into `main.rs` + `session.rs` + `compositor.rs`. `SessionState` holds the `PaneTree`, a `HashMap<PaneId, Arc<PaneState>>`, the focused pane id, and the current terminal size. Each `PaneState` owns its own `Mutex<Pty>` + `Mutex<Terminal>` + input mpsc. `Session::spawn` boots an initial pane and starts the compositor task; `Session::split_focused` adds a new ConPTY sized to the new pane's rect and resizes the sibling, `focus_move` nudges `focused`, `kill_focused` removes the pane and promotes the sibling (killing the last pane marks the session dead). Every mutation flips the `dirty: AtomicBool`.
+- Compositor runs on tokio at up to 60 Hz. On each tick: if `dirty` was set, build one composed frame — hide cursor + reset SGR + clear screen, walk each pane rect emitting per-cell SGR (bold/italic/underline/inverse + 8/16/256/truecolor fg/bg) and cell contents, draw box-drawing border segments (U+2502 vertical, U+2500 horizontal), then place the real terminal cursor at the focused pane's cursor position and show it. The entire frame ships as a single `ServerMsg::Output`.
+- `wmux` extends the Ctrl+A prefix handler: `"` = vsplit (new pane below, Dir::V), `%` = hsplit (new pane right, Dir::H), `h`/`j`/`k`/`l` = focus left/down/up/right, `x` = kill focused pane, `d` = detach (unchanged). Unknown keys after Ctrl+A still forward the Ctrl+A + the key, as before. New `StdinEvent::Command(Verb)` variant routes verbs to the pipe as `ClientMsg::Command` frames.
+- Known rough edges carried over: no resize-while-attached, no zoom, no mouse, no per-pane title; the compositor does a full redraw every frame (no cell-level diff).
 
 ### 2026-11-13 — M3 virtual grid + persistent session + snapshot on attach
 - Branch `m3-virtual-grid`. Workspace deps grew `vt100 = "0.15"`.

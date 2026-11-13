@@ -14,6 +14,7 @@ clap = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+vt100 = { workspace = true }
 
 wmux-conpty = { path = "../wmux-conpty" }
 wmux-core = { path = "../wmux-core" }
