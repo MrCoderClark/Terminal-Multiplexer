@@ -4,8 +4,8 @@ Running log of what's done, what's in flight, and what's blocked. Newest entries
 
 ## Status at a glance
 
-- **Current milestone:** M2 — one pane end-to-end (code written, awaiting first interactive attach).
-- **Last shipped:** M1 — ConPTY round-trip.
+- **Current milestone:** M3 — virtual grid (code written, awaiting first detach/reattach test).
+- **Last shipped:** M2 — one pane end-to-end.
 - **Blocked on:** nothing.
 
 ## Milestone checklist
@@ -22,6 +22,15 @@ Running log of what's done, what's in flight, and what's blocked. Newest entries
 - [ ] **M9 — docs + installer + v0.1.0.** README, zipped release, optional MSIX, tag.
 
 ## Log
+
+### 2026-11-13 — M3 virtual grid + persistent session + snapshot on attach
+- Branch `m3-virtual-grid`. Workspace deps grew `vt100 = "0.15"`.
+- `wmux-core` now exposes `Terminal`: a thin wrapper around `vt100::Parser` with `feed`, `resize`, `snapshot`, `size`. `vt100` bundles `vte` plus a real grid, cursor, and modes, so we got Alacritty-lineage VT emulation without hand-rolling.
+- `wmux-proto` adds `ServerMsg::GridSnapshot(Vec<u8>)` (VT bytes the client blits to stdout on attach) and bumps `PROTOCOL_VERSION` to `2` per CLAUDE.md rule #5.
+- `wmuxd` refactored into a persistent `Session` (owns `Pty`, `Terminal`, input/output threads) held in `DaemonState.session: AsyncMutex<Option<Session>>`. The PTY reader thread feeds the terminal on every chunk and, when a client is attached, also forwards the chunk to that client's `mpsc::UnboundedSender<Vec<u8>>`. On client disconnect the session stays alive — `detach()` just clears the `active_client` slot. When the PTY dies (`ReadFile` returns 0 / error), the reader thread flags the session dead; the next `Hello` sees `is_dead()` and spawns a fresh one.
+- `Session::attach()` returns `(output_rx, snapshot_bytes)` in one shot; the daemon sends `Welcome` then immediately pushes `ServerMsg::GridSnapshot(snapshot_bytes)` before entering the forward loop. `Session::resize()` resyncs the ConPTY and the virtual grid together so a reattaching client at a different size doesn't desync.
+- Client reads `Welcome`, then `GridSnapshot`, enters raw mode, writes the snapshot bytes to stdout, prints the detach banner, and enters the normal select loop. Running `wmux attach` after Ctrl+A d now brings up the shell with the same cursor / screen as the detached session.
+- Still deferred: resize-while-attached (pairs with M4's splits), scrollback (M8), and surfacing a way to kill a stuck session (M7).
 
 ### 2026-11-13 — M2 single-pane daemon + client written
 - Branch `m2-one-pane-end-to-end`. Workspace deps grew `tokio` (rt-multi-thread, macros, net, io-util, io-std, sync, time), `rmp-serde = "1.3"`, `crossterm = "0.28"`.

@@ -12,7 +12,11 @@ use wmux_ipc::{read_frame, write_frame, PIPE_NAME};
 use wmux_proto::{ClientMsg, Hello, PtySize, ServerMsg, PROTOCOL_VERSION};
 
 #[derive(Parser)]
-#[command(name = "wmux", version, about = "wmux client — a Windows terminal multiplexer")]
+#[command(
+    name = "wmux",
+    version,
+    about = "wmux client — a Windows terminal multiplexer"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Option<Cmd>,
@@ -73,15 +77,25 @@ async fn attach() -> Result<()> {
         other => bail!("expected Welcome, got {other:?}"),
     }
 
+    // --- grid snapshot --------------------------------------------------
+    // The daemon's next frame is a GridSnapshot carrying the VT redraw for
+    // the current screen state. Capture it (but write it only once we're in
+    // raw mode so the terminal is ready to render VT).
+    let snapshot_bytes = match read_frame::<ServerMsg, _>(&mut read_half).await? {
+        ServerMsg::GridSnapshot(bytes) => bytes,
+        other => bail!("expected GridSnapshot, got {other:?}"),
+    };
+
     // --- raw mode -------------------------------------------------------
     crossterm::terminal::enable_raw_mode().context("entering raw mode")?;
     let _guard = RawModeGuard;
 
-    // Banner printed inside raw mode needs explicit CR + LF.
+    // Redraw the detached state before anything else.
     {
         let mut out = std::io::stdout().lock();
-        let _ = out.write_all(b"[wmux] attached. Detach: Ctrl+A d\r\n");
-        let _ = out.flush();
+        out.write_all(&snapshot_bytes)?;
+        let _ = out.write_all(b"\r\n[wmux] attached. Detach: Ctrl+A d\r\n");
+        out.flush()?;
     }
 
     // --- stdin → event channel -----------------------------------------
@@ -127,9 +141,7 @@ async fn attach() -> Result<()> {
                             out.push(b);
                         }
                     }
-                    if !out.is_empty()
-                        && stdin_tx.blocking_send(StdinEvent::Bytes(out)).is_err()
-                    {
+                    if !out.is_empty() && stdin_tx.blocking_send(StdinEvent::Bytes(out)).is_err() {
                         return;
                     }
                 }

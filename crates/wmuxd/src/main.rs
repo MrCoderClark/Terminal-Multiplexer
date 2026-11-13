@@ -1,18 +1,163 @@
 #![forbid(unsafe_code)]
 
 use std::io::{Read, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use anyhow::{bail, Context, Result};
 use clap::Parser;
 use tokio::io::AsyncWriteExt;
 use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Mutex as AsyncMutex};
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 use wmux_conpty::{Pty, PtySize as ConptySize};
+use wmux_core::Terminal;
 use wmux_ipc::{read_frame, write_frame, PIPE_NAME};
-use wmux_proto::{ClientMsg, Hello, PtySize, ServerMsg, Welcome, PROTOCOL_VERSION};
+use wmux_proto::{ClientMsg, PtySize, ServerMsg, Welcome, PROTOCOL_VERSION};
+
+// ---------------------------------------------------------------------------
+// Session
+// ---------------------------------------------------------------------------
+
+#[derive(Clone)]
+struct Session {
+    inner: Arc<SessionInner>,
+}
+
+struct SessionInner {
+    pty: Mutex<Pty>,
+    terminal: Mutex<Terminal>,
+    input_tx: std::sync::mpsc::Sender<Vec<u8>>,
+    // Set to Some(sender) while a client is attached. The reader thread
+    // forwards every chunk it reads from the PTY both into the terminal
+    // (always) and into this channel (if any client is listening).
+    active_client: Mutex<Option<mpsc::UnboundedSender<Vec<u8>>>>,
+    dead: AtomicBool,
+    pid: u32,
+}
+
+impl Session {
+    fn spawn(size: PtySize) -> Result<Self> {
+        let (pty, mut pty_reader, mut pty_writer) = Pty::spawn(
+            "cmd.exe",
+            ConptySize {
+                cols: size.cols,
+                rows: size.rows,
+            },
+        )
+        .context("spawning ConPTY")?;
+        let pid = pty.pid();
+
+        let terminal = Terminal::new(size.cols, size.rows);
+        let (input_tx, input_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+
+        let inner = Arc::new(SessionInner {
+            pty: Mutex::new(pty),
+            terminal: Mutex::new(terminal),
+            input_tx,
+            active_client: Mutex::new(None),
+            dead: AtomicBool::new(false),
+            pid,
+        });
+
+        // Reader thread: PTY → Terminal + active client.
+        {
+            let inner = inner.clone();
+            std::thread::spawn(move || {
+                let mut buf = [0u8; 4096];
+                loop {
+                    match pty_reader.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            let chunk = buf[..n].to_vec();
+                            inner.terminal.lock().unwrap().feed(&chunk);
+                            let client = inner.active_client.lock().unwrap().clone();
+                            if let Some(tx) = client {
+                                let _ = tx.send(chunk);
+                            }
+                        }
+                    }
+                }
+                debug!(pid = inner.pid, "pty reader thread exiting");
+                inner.dead.store(true, Ordering::Release);
+                *inner.active_client.lock().unwrap() = None;
+            });
+        }
+
+        // Writer thread: input_rx → PTY.
+        std::thread::spawn(move || {
+            while let Ok(bytes) = input_rx.recv() {
+                if pty_writer.write_all(&bytes).is_err() {
+                    break;
+                }
+                let _ = pty_writer.flush();
+            }
+            debug!("pty writer thread exiting");
+        });
+
+        info!(pid, cols = size.cols, rows = size.rows, "spawned session");
+
+        Ok(Self { inner })
+    }
+
+    fn is_dead(&self) -> bool {
+        self.inner.dead.load(Ordering::Acquire)
+    }
+
+    fn pid(&self) -> u32 {
+        self.inner.pid
+    }
+
+    // Registers a fresh client channel and returns the receive half plus a
+    // snapshot of the current screen. If a stale client was still registered,
+    // it is dropped — only one attachment at a time in M3.
+    fn attach(&self) -> (mpsc::UnboundedReceiver<Vec<u8>>, Vec<u8>) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        *self.inner.active_client.lock().unwrap() = Some(tx);
+        let snapshot = self.inner.terminal.lock().unwrap().snapshot();
+        (rx, snapshot)
+    }
+
+    fn detach(&self) {
+        *self.inner.active_client.lock().unwrap() = None;
+    }
+
+    fn send_input(&self, bytes: Vec<u8>) -> Result<()> {
+        self.inner
+            .input_tx
+            .send(bytes)
+            .map_err(|_| anyhow::anyhow!("session writer thread is gone"))
+    }
+
+    fn resize(&self, size: PtySize) -> Result<()> {
+        self.inner
+            .pty
+            .lock()
+            .unwrap()
+            .resize(ConptySize {
+                cols: size.cols,
+                rows: size.rows,
+            })
+            .context("ResizePseudoConsole")?;
+        self.inner
+            .terminal
+            .lock()
+            .unwrap()
+            .resize(size.cols, size.rows);
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Daemon
+// ---------------------------------------------------------------------------
+
+struct DaemonState {
+    // One session for M3. The registry lands with M4/M7.
+    session: AsyncMutex<Option<Session>>,
+}
 
 #[derive(Parser)]
 #[command(name = "wmuxd", version, about = "wmux daemon")]
@@ -46,34 +191,41 @@ fn main() -> Result<()> {
 async fn run() -> Result<()> {
     info!(pipe = PIPE_NAME, "listening on named pipe");
 
+    let state = Arc::new(DaemonState {
+        session: AsyncMutex::new(None),
+    });
+
     let mut server = ServerOptions::new()
         .first_pipe_instance(true)
         .create(PIPE_NAME)
         .with_context(|| format!("creating named pipe {PIPE_NAME}"))?;
 
-    // M2 serves one client at a time: after the current attach finishes,
-    // we loop back and open another pipe instance. Multi-attach lands with
-    // the session registry in M3/M4.
     loop {
-        server.connect().await.context("waiting for client connect")?;
+        server
+            .connect()
+            .await
+            .context("waiting for client connect")?;
         info!("client connected");
 
-        // Hand the connected instance to the handler and immediately prepare
-        // the next instance so a fresh client won't see "pipe busy".
+        // Prepare the next pipe instance before handing this one off so a
+        // fresh client doesn't see "pipe busy".
         let this_client = server;
         server = ServerOptions::new()
             .create(PIPE_NAME)
             .with_context(|| format!("re-creating named pipe {PIPE_NAME}"))?;
 
-        if let Err(e) = handle_client(this_client).await {
-            error!(error = %e, "client session ended with error");
-        } else {
-            info!("client session ended cleanly");
-        }
+        let state = state.clone();
+        tokio::spawn(async move {
+            if let Err(e) = handle_client(this_client, state).await {
+                error!(error = %e, "client session ended with error");
+            } else {
+                info!("client session ended cleanly");
+            }
+        });
     }
 }
 
-async fn handle_client(pipe: NamedPipeServer) -> Result<()> {
+async fn handle_client(pipe: NamedPipeServer, state: Arc<DaemonState>) -> Result<()> {
     let (mut read_half, mut write_half) = tokio::io::split(pipe);
 
     // --- handshake ------------------------------------------------------
@@ -82,7 +234,6 @@ async fn handle_client(pipe: NamedPipeServer) -> Result<()> {
         ClientMsg::Hello(h) => h,
         other => bail!("expected Hello, got {:?}", other),
     };
-
     debug!(?hello, "received Hello");
 
     if hello.protocol_version != PROTOCOL_VERSION {
@@ -102,118 +253,93 @@ async fn handle_client(pipe: NamedPipeServer) -> Result<()> {
         return Ok(());
     }
 
-    // --- spawn the pane -------------------------------------------------
-    let Hello { term_size, .. } = hello;
-    let (pty, pty_reader, pty_writer) = Pty::spawn(
-        "cmd.exe",
-        ConptySize {
-            cols: term_size.cols,
-            rows: term_size.rows,
-        },
-    )
-    .context("spawning ConPTY")?;
+    // --- find or create session ----------------------------------------
+    let session: Session = {
+        let mut guard = state.session.lock().await;
+        let reuse = guard.as_ref().map(|s| !s.is_dead()).unwrap_or(false);
+        if !reuse {
+            info!("spawning fresh session");
+            *guard = Some(Session::spawn(hello.term_size)?);
+        } else if let Some(ref s) = *guard {
+            // The reattaching client may have a different terminal size
+            // than the previous one; resync the ConPTY and the virtual grid.
+            if let Err(e) = s.resize(hello.term_size) {
+                warn!(error = %e, "resize on attach failed");
+            }
+        }
+        guard.as_ref().unwrap().clone()
+    };
 
-    info!(pid = pty.pid(), "spawned cmd.exe");
+    let (mut output_rx, snapshot_bytes) = session.attach();
 
     write_frame(
         &mut write_half,
         &ServerMsg::Welcome(Welcome {
-            session_id: pty.pid() as u64,
+            session_id: session.pid() as u64,
             protocol_version: PROTOCOL_VERSION,
         }),
     )
     .await
     .context("sending Welcome")?;
 
-    // --- pumps ----------------------------------------------------------
-    // PTY reads and writes are blocking file I/O. Spin two OS threads that
-    // bridge to tokio via channels so we can mix them with the async pipe.
-    let (output_tx, mut output_rx) = mpsc::channel::<Vec<u8>>(64);
-    let reader_thread = std::thread::spawn(move || pump_pty_to_channel(pty_reader, output_tx));
+    write_frame(&mut write_half, &ServerMsg::GridSnapshot(snapshot_bytes))
+        .await
+        .context("sending GridSnapshot")?;
 
-    let (input_tx, input_rx) = std::sync::mpsc::channel::<Vec<u8>>();
-    let writer_thread = std::thread::spawn(move || pump_channel_to_pty(pty_writer, input_rx));
-
-    // Task: forward PTY output chunks → ServerMsg::Output frames.
-    let output_task = tokio::spawn(async move {
-        while let Some(bytes) = output_rx.recv().await {
-            if write_frame(&mut write_half, &ServerMsg::Output(bytes))
-                .await
-                .is_err()
-            {
-                break;
-            }
-        }
-        // Signal client-side the session is closing. Best-effort.
-        let _ = write_frame(&mut write_half, &ServerMsg::Bye("pty closed".into())).await;
-        let _ = write_half.shutdown().await;
-    });
-
-    // Main loop: read ClientMsg frames; dispatch.
-    let mut pty_holder = Some(pty);
+    // --- main loop: pipe ↔ session -------------------------------------
+    let mut graceful_bye = false;
     loop {
-        match read_frame::<ClientMsg, _>(&mut read_half).await {
-            Ok(ClientMsg::Input(bytes)) => {
-                if input_tx.send(bytes).is_err() {
-                    debug!("pty writer thread gone");
-                    break;
-                }
-            }
-            Ok(ClientMsg::Resize(size)) => {
-                if let Some(ref pty) = pty_holder {
-                    if let Err(e) = pty.resize(ConptySize {
-                        cols: size.cols,
-                        rows: size.rows,
-                    }) {
-                        warn!(error = %e, "resize failed");
+        tokio::select! {
+            msg = read_frame::<ClientMsg, _>(&mut read_half) => {
+                match msg {
+                    Ok(ClientMsg::Input(bytes)) => {
+                        if session.send_input(bytes).is_err() {
+                            break;
+                        }
+                    }
+                    Ok(ClientMsg::Resize(size)) => {
+                        if let Err(e) = session.resize(size) {
+                            warn!(error = %e, "resize failed");
+                        }
+                    }
+                    Ok(ClientMsg::Bye) => {
+                        debug!("client sent Bye");
+                        graceful_bye = true;
+                        break;
+                    }
+                    Ok(ClientMsg::Hello(_)) => warn!("unexpected second Hello — ignoring"),
+                    Err(e) => {
+                        debug!(error = %e, "client read ended");
+                        break;
                     }
                 }
             }
-            Ok(ClientMsg::Bye) => {
-                debug!("client sent Bye");
-                break;
-            }
-            Ok(ClientMsg::Hello(_)) => {
-                warn!("unexpected second Hello — ignoring");
-            }
-            Err(e) => {
-                debug!(error = %e, "client read ended");
-                break;
-            }
-        }
-    }
-
-    // Tearing down: drop Pty (closes ConPTY → reader thread EOFs), drop
-    // input channel (writer thread exits), await the output task.
-    drop(input_tx);
-    let _ = writer_thread.join();
-    drop(pty_holder.take());
-    let _ = reader_thread.join();
-    let _ = output_task.await;
-
-    Ok(())
-}
-
-fn pump_pty_to_channel(mut reader: wmux_conpty::PtyReader, tx: mpsc::Sender<Vec<u8>>) {
-    let mut buf = [0u8; 4096];
-    loop {
-        match reader.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => {
-                if tx.blocking_send(buf[..n].to_vec()).is_err() {
-                    break;
+            chunk = output_rx.recv() => {
+                match chunk {
+                    Some(bytes) => {
+                        if write_frame(&mut write_half, &ServerMsg::Output(bytes))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    None => {
+                        // PTY closed. Session is dead — tell the client.
+                        let _ = write_frame(
+                            &mut write_half,
+                            &ServerMsg::Bye("pty closed".into()),
+                        )
+                        .await;
+                        break;
+                    }
                 }
             }
-            Err(_) => break,
         }
     }
-}
 
-fn pump_channel_to_pty(mut writer: wmux_conpty::PtyWriter, rx: std::sync::mpsc::Receiver<Vec<u8>>) {
-    while let Ok(bytes) = rx.recv() {
-        if writer.write_all(&bytes).is_err() {
-            break;
-        }
-        let _ = writer.flush();
-    }
+    session.detach();
+    let _ = write_half.shutdown().await;
+    debug!(graceful_bye, "handle_client returning");
+    Ok(())
 }
