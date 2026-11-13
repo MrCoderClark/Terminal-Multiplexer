@@ -4,7 +4,7 @@ Running log of what's done, what's in flight, and what's blocked. Newest entries
 
 ## Status at a glance
 
-- **Current milestone:** M0 — workspace scaffold.
+- **Current milestone:** M0 — workspace scaffold (scaffold written, awaiting first `cargo build`).
 - **Last shipped:** nothing yet.
 - **Blocked on:** nothing.
 
@@ -22,6 +22,17 @@ Running log of what's done, what's in flight, and what's blocked. Newest entries
 - [ ] **M9 — docs + installer + v0.1.0.** README, zipped release, optional MSIX, tag.
 
 ## Log
+
+### 2026-11-13 — M0 scaffold laid down
+- Branch `m0-scaffold`. Workspace `Cargo.toml` with `resolver = "2"`, `members = ["crates/*"]`, shared `workspace.package` (version 0.0.1, edition 2021, rust 1.75) and `workspace.dependencies` for `anyhow`, `clap`, `thiserror`, `serde`, `tracing`, `tracing-subscriber`.
+- Six crate skeletons created: `wmux-core`, `wmux-proto`, `wmux-conpty`, `wmux-ipc`, `wmuxd`, `wmux`. Every crate forbids `unsafe` except `wmux-conpty`, which carries a `compile_error!` guard on non-Windows targets so cross-building fails loudly.
+- `wmux-proto` defines `PROTOCOL_VERSION: u32 = 1` — the constant CLAUDE.md pins as the version the client enforces.
+- `wmuxd` main parses `--foreground`, wires `tracing-subscriber` to **stderr** (never stdout, per CLAUDE.md rule 4), and uses `EnvFilter` so `RUST_LOG=wmuxd=debug` works.
+- `wmux` main is a bare clap derive with no subcommands yet — enough to satisfy the M0 acceptance criterion `wmux --version`. Subcommand plumbing lands in M7.
+- `rust-toolchain.toml` pins stable + rustfmt + clippy.
+- `.github/workflows/ci.yml` runs on `windows-latest`: fmt check, clippy with `-D warnings`, `cargo test --workspace`, and executes `cargo run -p wmux -- --version` as a smoke check.
+- `examples/config.toml` lifted verbatim from SPEC §6.
+- CLAUDE.md gained a **How we work together** section codifying two rules: the user runs shell commands (I propose, they execute) and every new feature/milestone opens its own branch (`mN-<slug>` / `feat/<slug>`).
 
 ### 2026-11-13 — project kickoff
 - Decided on Rust for the implementation (memory safety, strong `windows` crate, prior art in WezTerm / Alacritty / Zellij).
