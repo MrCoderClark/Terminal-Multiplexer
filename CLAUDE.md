@@ -15,6 +15,11 @@ A native Windows terminal multiplexer. Rust. Two binaries (`wmuxd`, `wmux`) in o
 5. **Protocol changes bump `wmux-proto`'s version constant.** Client refuses mismatched daemons with a clear message rather than deserializing wrong bytes.
 6. **Backwards-compat shims are banned until v0.1.0 ships.** Pre-release, just change the thing.
 
+## How we work together
+
+- **Let the user run shell commands unless they tell you otherwise.** Default to proposing the exact command (in a fenced block) and letting them paste or `!`-run it, rather than firing it yourself via Bash/PowerShell. File edits via Read/Write/Edit are fine; it's shell execution that defers to them.
+- **Every new feature or milestone starts on its own branch.** Before writing code for it, confirm the branch name and ask the user to create it (`git checkout -b <name>` or similar). Naming convention: `mN-<slug>` for milestone work (e.g. `m0-scaffold`), `feat/<slug>` for other features.
+
 ## House style
 
 - `rustfmt` defaults. `cargo fmt --all` before committing.

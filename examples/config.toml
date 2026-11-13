@@ -1,0 +1,27 @@
+# Example wmux config. Copy to %APPDATA%\wmux\config.toml and edit.
+
+default_shell = "pwsh.exe"
+default_shell_args = ["-NoLogo"]
+prefix = "Ctrl+A"
+scrollback_lines = 10000
+mouse = true
+status_interval_ms = 1000
+detach_keep_alive = true
+
+[status_line]
+left  = "#{session_name} | #{window_index}:#{window_name}"
+right = "#{cpu}% | #{mem_mb}MB | %H:%M"
+
+[[binding]]
+key    = "prefix v"
+action = "split-pane --vertical"
+
+[[binding]]
+key    = "prefix h"
+action = "split-pane --horizontal"
+
+[colors]
+status_fg       = "#e6e6e6"
+status_bg       = "#303030"
+border_active   = "#5fafff"
+border_inactive = "#404040"
